@@ -161,7 +161,7 @@ fi
 
 echo ""
 echo "Setup complete."
-echo "  Install system deps: sudo apt-get install -y libx11-dev libasound2-dev libffi-dev"
+echo "  Install system deps: sudo apt-get install -y libx11-dev libasound2-dev libffi-dev pkgconf"
 echo "  Build:   make"
 echo "  Test:    bash run_tests.sh"
 echo "  Options: make NO_TINYGL=1  (skip TinyGL)"
