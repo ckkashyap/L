@@ -1,0 +1,1827 @@
+================================================================================
+  L -- lispIsPerfect9  INTERPRETER SPECIFICATION
+  Version 2.0  (April 2026)
+================================================================================
+
+OVERVIEW AND PHILOSOPHY
+────────────────────────────────────────────────────────────────────────────────
+
+L is a compact, pragmatic Lisp interpreter for systems programming, live coding,
+and multimedia applications.  It is written in portable C (C17) and targets
+Windows (MSVC) and POSIX (Linux, macOS, BSD).  Zero external runtime dependencies:
+I/O, graphics, audio, and font rendering are all native platform backends.
+
+DESIGN INSPIRATIONS
+
+  PicoLisp     -- Primary Lisp inspiration.  Dynamic scoping, de/dm function
+                  definition, property lists on every symbol, make/link/chain
+                  list construction, with/This OOP context.  L aims for the
+                  same minimalism and directness.  PicoLisp's philosophy:
+                  "the interpreter IS the application"; no separate compilation
+                  step; the REPL is the primary interface.
+
+  libbf         -- Arbitrary-precision numeric backend (optional).  Provides
+                  both bignums (unlimited integer precision) and floats
+                  (128-bit precision via bf_t).  Without it, L falls back to
+                  int64_t integers with overflow detection.  Integers promote
+                  automatically: int32 → bignum.  Float literals (3.14) and
+                  math functions (sin, cos, sqrt, exp, log) use libbf.
+
+  Clojure       -- Influenced persistent data structures: HAMT hash maps
+                  (O(log₃₂ n)), 32-way trie vectors, destructuring bind.
+                  Coroutines fill the generator/lazy-sequence role.
+                  Also: immutable-by-default lists, structural sharing.
+
+  Native I/O    -- Built-in event loop using poll(2) on POSIX, WSAPoll on
+                  Windows.  TCP, timers, HTTP server (lib/http.l), WebSocket
+                  (lib/websocket.l), subprocess spawning.  No external I/O
+                  library (libuv was removed).
+
+  Native GFX    -- Built-in 2D graphics using Win32 GDI on Windows, Xlib on
+                  Linux.  Built-in TTF font rasterizer (src/ttf.c) with 4×
+                  supersampled antialiasing.  No SDL dependency.
+
+  Native Audio  -- Built-in audio using WASAPI on Windows, ALSA on Linux.
+                  Background voice mixer thread with 32 concurrent voices,
+                  20ms latency.  SonicPi-inspired: tones, drums, samples,
+                  layered polyphony, ahead-of-time scheduling.
+
+  TinyGL        -- Optional software-rendered 3D graphics, a subset of
+                  OpenGL 1.x.  Auto-detected from deps/tinygl/.
+
+  SonicPi       -- Live coding culture: Sam Aaron's temporal model for
+                  drift-free beat scheduling.  audio-at schedules samples at
+                  absolute mixer timestamps.  The REPL stays responsive while
+                  audio plays via raw terminal mode + non-blocking reads.
+
+CORE PHILOSOPHY
+
+  1. One canonical representation: every Lisp value is a single 64-bit
+     NaN-boxed word.  No pointers to "header" objects.  Uniform, cache-friendly.
+
+  2. Minimalism over completeness.  Every feature earns its place.  Prefer
+     composing small primitives over adding new special cases.
+
+  3. Dynamic scoping is the default (PicoLisp-style).  Lexical closures are
+     available via lambda but are the exception, not the rule.  This makes de
+     functions transparent and debuggable -- free variables in a de body are
+     always resolved at call time, not definition time.
+
+  4. Tail calls are always optimised.  The last expression in every body runs
+     without consuming a C stack frame.  Recursion and iteration are equivalent.
+     Implement this via a single goto tail_call label inside eval().
+
+  5. The GC is stop-the-world mark-sweep.  Mark phase is iterative (explicit
+     work stack, never recursive) so pathologically deep structures never
+     overflow the C stack.  Non-moving: all pool indices are stable through GC.
+
+  6. Coroutines are first-class.  Any function can become a generator with
+     yield.  Pipelines of coroutines compose naturally with co-resume.  The GC
+     is coroutine-aware: suspended roots survive collection via snapshot/restore.
+
+  7. FFI over reimplementation.  CPU-bound algorithms belong in C libraries
+     loaded via native.  L provides the glue: argument marshalling, callback
+     dispatch, memory ownership.  On Windows the built-in x64 ABI caller
+     handles the common case without libffi.
+
+  8. Live coding matters.  Startup is fast (lazy heap commitment, only 4 MB
+     touched at startup).  The REPL is the primary entry point.  Audio and
+     graphics primitives are available without leaving the interpreter.  The
+     whole interpreter fits in ~12000 lines of C with zero runtime deps.
+
+  9. Floating point via libbf.  128-bit precision (39 decimal digits).
+     0.1 * 0.2 = 0.02 exactly (no IEEE 754 rounding artifacts).  Full math
+     library: sin, cos, tan, sqrt, exp, log, pow, atan, asin, acos.
+
+ 10. Persistent data structures.  HAMT hash maps (O(log₃₂ n) get/put/del),
+     32-way trie vectors (Clojure-style).  Structural sharing: updates copy
+     only the path from root to leaf.
+
+ 11. Destructuring bind.  (let (((a b . rest) val)) ...) works in let, let*,
+     lambda, and de.  Nested patterns of arbitrary depth.
+
+
+================================================================================
+  PART I -- VALUE REPRESENTATION
+================================================================================
+
+NaN-BOXING SCHEME
+─────────────────
+All Lisp values are encoded in a single 64-bit unsigned integer:
+
+  typedef uint64_t Val;
+
+  Bits 63–48 : 16-bit type tag
+  Bits 47–0  : 48-bit payload (immediate value or pool index, lower 32 bits used)
+
+IEEE 754 quiet NaN occupies bits where bits[63:52] = 0x7FF and bit 51 = 1,
+giving range 0x7FF8xxxxxxxxxxxx .. 0x7FFFxxxxxxxxxxxx.  All L tags are chosen
+in this range or above 0x8000 so they never alias a valid IEEE 754 double.
+
+TAG CONSTANTS  (bits 63–48)
+───────────────────────────
+  TAG_INT   0x7FFF   32-bit signed integer (immediate; zero-extended in low 32)
+  TAG_SYM   0x7FFA   Symbol -- 32-bit index into g_syms[]
+  TAG_STR   0x7FFB   Interned string -- 32-bit index into g_strs[]
+  TAG_CONS  0x7FFC   Cons cell -- 32-bit index into g_cells[]
+  TAG_PRIM  0x7FF9   Primitive function -- 32-bit index into g_prims[]
+  TAG_PIPE  0x7FF8   Pipe/process handle -- 32-bit pool index
+  TAG_CORO  0x7FF7   Coroutine -- 32-bit index into g_coros[]
+  TAG_BIG   0xFFFE   Bignum -- 32-bit index into g_bignums[]
+  TAG_VEC   0xFFFC   Mutable vector -- 32-bit index into g_vec_pool[]
+  TAG_NIL   0xFFFF   The empty list / NIL (singleton; payload always 0)
+
+INTERNAL SENTINEL (never exposed to user code)
+  EOF_VAL tag 0xFFFD  -- returned by reader at end of input
+
+ENCODING MACROS
+───────────────
+  MAKE_VAL(tag, payload)   (Val)(((uint64_t)(tag) << 48) | ((uint64_t)(payload) & 0x0000FFFFFFFFFFFF))
+  VAL_TAG(v)               (uint64_t)(v) >> 48
+  VAL_PAYLOAD(v)           (uint64_t)(v) & 0x0000FFFFFFFFFFFF
+
+  NIL_VAL                  MAKE_VAL(TAG_NIL, 0)
+  MAKE_INT(i)              MAKE_VAL(TAG_INT, (uint64_t)(uint32_t)(int32_t)(i))
+  INT_VAL(v)               (int32_t)(uint32_t)(VAL_PAYLOAD(v) & 0xFFFFFFFF)
+
+  Heap-object constructors: MAKE_SYM(idx)  MAKE_STR(idx)  MAKE_CONS(idx)
+                             MAKE_PRIM(idx) MAKE_BIG(idx)  MAKE_VEC(idx)
+                             MAKE_PIPE(idx) MAKE_CORO(idx)
+  Index extractors:          SYM_IDX   STR_IDX   CONS_IDX   PRIM_IDX
+                             BIG_IDX   VEC_IDX   PIPE_IDX   CORO_IDX
+  All extract the lower 32 bits of VAL_PAYLOAD(v).
+
+TYPE PREDICATES
+───────────────
+  IS_NIL(v)   IS_INT(v)   IS_SYM(v)   IS_STR(v)   IS_CONS(v)
+  IS_PRIM(v)  IS_BIG(v)   IS_VEC(v)   IS_PIPE(v)  IS_CORO(v)
+  IS_PAIR(v) = IS_CONS(v)
+  IS_ATOM(v) = !IS_CONS(v)
+
+TRUTH SEMANTICS
+───────────────
+  NIL is the only false value.  Everything else -- including integer 0 -- is true.
+  IS_FALSE(v)  IS_NIL(v)
+  IS_TRUE(v)   !IS_NIL(v)
+
+  The symbol T is self-evaluating: g_syms[g_sym_T].value = MAKE_SYM(g_sym_T).
+  T_VAL = MAKE_SYM(g_sym_T).
+
+
+================================================================================
+  PART II -- HEAP, GC, AND POOLS
+================================================================================
+
+CONS CELL STRUCT
+────────────────
+  typedef struct {
+      Val     car;       // 8 bytes
+      Val     cdr;       // 8 bytes
+      uint8_t mark;      // 1 byte GC mark bit
+      uint8_t _pad[7];   // 7 bytes padding (struct = 24 bytes)
+  } Cell;
+
+  Cell     g_cells[CELL_POOL_SIZE];     // CELL_POOL_SIZE = 16,777,216 (~384 MB BSS)
+  uint32_t g_free_head  = UINT32_MAX;   // freelist head; UINT32_MAX = empty
+  uint32_t g_n_cells_used    = 0;
+  uint32_t g_cells_committed = 0;       // cells chained into freelist so far
+
+LAZY HEAP COMMITMENT
+────────────────────
+  HEAP_INIT_CELLS   = 262,144  (committed at startup -- 4 MB, avoids startup lag)
+  HEAP_EXTEND_CELLS = 262,144  (committed on demand when freelist exhausted)
+
+  On Windows, touching all 64 MB at startup would cause ~35 ms of page faults.
+  Lazy commitment keeps startup fast.
+
+FREELIST STRUCTURE
+──────────────────
+  Each free cell's CDR = MAKE_CONS(next_idx)  (NOT a raw integer index).
+  Last free cell's CDR = NIL_VAL.
+  g_free_head = index of the first free cell.
+
+  heap_alloc_cell():
+    1. Freelist empty AND committed region not full → heap_extend() (fast, O(N))
+    2. Freelist empty AND region full → gc_collect() (full mark-sweep)
+    3. Still empty → pl_error_str("out of memory")
+    4. Pop cell; zero car/cdr; clear mark; increment g_n_cells_used; return index.
+
+  pl_cons(car, cdr):
+    idx = heap_alloc_cell();
+    g_cells[idx].car = car;
+    g_cells[idx].cdr = cdr;
+    return MAKE_CONS(idx);
+
+CONS ACCESSORS
+──────────────
+  CAR(v)    g_cells[CONS_IDX(v)].car
+  CDR(v)    g_cells[CONS_IDX(v)].cdr
+  CADR(v)   CAR(CDR(v))       CDDR(v)   CDR(CDR(v))
+  CADDR(v)  CAR(CDDR(v))      CDDDR(v)  CDR(CDDR(v))
+  CAAR(v)   CAR(CAR(v))       CAAAR(v)  CAR(CAAR(v))
+
+LIST CONVENIENCE MACROS
+───────────────────────
+  LIST1(a)       pl_cons(a, NIL_VAL)
+  LIST2(a, b)    pl_cons(a, LIST1(b))
+  LIST3(a, b, c) pl_cons(a, LIST2(b, c))
+
+GARBAGE COLLECTOR
+─────────────────
+  Algorithm: Stop-the-world, non-moving mark-sweep.
+  GC is triggered by heap_alloc_cell() when the freelist is exhausted and
+  no more uncommitted cells remain.
+
+  ── MARK PHASE (iterative, no C-stack recursion) ──
+
+  static Val gc_mark_stack[GC_MARK_STACK_SIZE];  // GC_MARK_STACK_SIZE = 1,048,576
+  static int gc_mark_top = 0;
+
+  gc_mark_val(v):
+    Push v; while stack non-empty: pop cur.
+    If cons: if unmarked, mark it, push CDR then CAR (LIFO so CAR processed next).
+    If vec:  call mark_vec() which marks the VecSlot and pushes all elements.
+    If pipe: call mark_pipe() (platform-specific).
+    INT/SYM/STR/BIG/NIL/PRIM: no cell to mark.
+    BIG marking is handled separately by gc_mark_bignums().
+
+  Roots marked (in order):
+    1. g_gc_roots[0..g_gc_root_top)        -- explicit C-side root stack
+    2. g_syms[1..g_sym_count].value        -- every symbol's global value
+    3. g_syms[1..g_sym_count].plist        -- every symbol's property list
+    4. g_bind_stack[0..g_bind_top].saved   -- dynamic bind stack saved values
+    5. g_at                                -- @ result register
+    6. g_make_head, g_make_tail            -- make/link list accumulator
+    7. gc_mark_coros()                     -- coroutine fn, send/yield vals,
+                                             saved root slices of all suspended coros
+    8. gc_mark_bignums()                   -- bignums reachable from all marked roots
+
+  Before the mark phase: gc_clear_bignum_marks() resets all bignum marks to 0.
+  Bignums are allocated with mark=1 to survive allocation-time GC; clearing here
+  ensures unreachable bignums are correctly collected.
+
+  ── SWEEP PHASE ──
+
+  gc_sweep_cells():
+    Walk g_cells[0..g_cells_committed) BACKWARDS (for cache-friendly freelist).
+    Unmarked → prepend to freelist.
+    Marked   → clear mark; count as live.
+
+  gc_sweep_vecs():
+    Walk g_vec_pool[0..g_vec_count).
+    If unmarked AND data != NULL: free(data); zero len/cap.
+    Clear mark regardless.
+
+  gc_sweep_bignums(): free unmarked bignum slots.
+  gc_sweep_pipes(): close unmarked pipe handles.
+
+  Error if freelist is still UINT32_MAX after sweep: "out of memory".
+
+GC ROOT STACK
+─────────────
+  Val g_gc_roots[GC_ROOT_STACK_SIZE];   // GC_ROOT_STACK_SIZE = 262,144
+  int g_gc_root_top = 0;
+
+  PUSH_ROOT(v)    g_gc_roots[g_gc_root_top++] = (v)
+  POP_ROOT()      g_gc_root_top--
+  PEEK_ROOT()     g_gc_roots[g_gc_root_top - 1]
+
+  Any C local Val that must survive a call to pl_cons() or any other
+  allocating function MUST be on the root stack during that call.
+  Failure to root causes silent corruption when GC collects it.
+
+  Pattern for 2-allocation sequences:
+    PUSH_ROOT(val);           // protect val across first alloc
+    PUSH_ROOT(key);           // protect key too
+    Val new_pair = pl_cons(key, val);
+    POP_ROOT();               // key (now in new_pair)
+    PUSH_ROOT(new_pair);      // protect new_pair across second alloc
+    Val new_list = pl_cons(new_pair, existing_list);
+    POP_ROOT(); POP_ROOT();   // new_pair, val
+
+MUTABLE VECTOR POOL
+───────────────────
+  typedef struct {
+      Val      *data;   // heap-allocated array of Val
+      uint32_t  len;    // current element count
+      uint32_t  cap;    // allocated capacity (for push growth)
+      uint8_t   mark;   // GC mark bit
+  } VecSlot;
+
+  VecSlot  g_vec_pool[VEC_POOL_SIZE];   // VEC_POOL_SIZE = 65,536
+  uint32_t g_vec_count = 0;
+
+  Vectors are bump-allocated (g_vec_count++); no vector freelist.
+  Unmarked vectors have their data free'd during GC sweep; the VecSlot itself
+  is never reclaimed (g_vec_count never decreases).
+
+DYNAMIC BIND STACK
+──────────────────
+  typedef struct {
+      uint32_t sym_idx;   // which symbol was rebound
+      Val      saved;     // its previous value
+  } BindFrame;
+
+  BindFrame g_bind_stack[BIND_STACK_SIZE];   // BIND_STACK_SIZE = 65,536
+  int       g_bind_top = 0;
+
+MAKE / LINK ACCUMULATOR GLOBALS
+────────────────────────────────
+  Val g_make_head = NIL_VAL;   // head of list being built by (make ...)
+  Val g_make_tail = NIL_VAL;   // last cons cell (for O(1) append)
+
+@ RESULT REGISTER
+─────────────────
+  Val g_at = NIL_VAL;   // holds most recent top-level eval result
+
+
+================================================================================
+  PART III -- SYMBOL AND STRING TABLES
+================================================================================
+
+SYMBOL TABLE
+────────────
+  typedef struct {
+      uint32_t name_idx;   // index into g_strs[] (interned name string)
+      Val      value;      // global/dynamic value binding (NIL_VAL on creation)
+      Val      plist;      // property list -- alist of (key . val) pairs
+      uint32_t hash;       // cached FNV-1a hash of the name
+      uint32_t next;       // singly-linked bucket chain; 0 = end
+  } SymSlot;
+
+  SymSlot  g_syms[SYM_SLOT_COUNT];            // SYM_SLOT_COUNT   = 131,072
+  uint32_t g_sym_buckets[SYM_BUCKET_COUNT];   // SYM_BUCKET_COUNT = 32,768
+  uint32_t g_sym_count = 0;
+
+  Index 0 is reserved (chain terminator sentinel); all valid indices are 1-based.
+  Lookup: hash name → bucket → walk chain comparing hash then bytes.
+  On miss: intern name string, allocate new slot; value = NIL_VAL; plist = NIL_VAL.
+
+STRING INTERN TABLE
+───────────────────
+  typedef struct {
+      char    *ptr;        // heap-allocated NUL-terminated UTF-8 bytes
+      uint32_t len;        // byte length (not including NUL)
+      uint32_t hash;       // cached FNV-1a hash
+      uint32_t next;       // singly-linked bucket chain; 0 = end
+  } StrSlot;
+
+  StrSlot  g_strs[STR_SLOT_COUNT];            // STR_SLOT_COUNT   = 2,097,152
+  uint32_t g_str_buckets[STR_BUCKET_COUNT];   // STR_BUCKET_COUNT = 524,288
+  uint32_t g_str_count = 0;
+
+  All L string values are interned.  Equal strings are the same Val.
+  str_intern(ptr, len) is idempotent.
+
+FNV-1a HASH (32-bit)
+─────────────────────
+  uint32_t h = 2166136261u;
+  for (size_t i = 0; i < len; i++)
+      h = (h ^ (uint8_t)s[i]) * 16777619u;
+
+WELL-KNOWN SYMBOLS  (interned by sym_init(); stored as uint32_t globals)
+─────────────────────────────────────────────────────────────────────────
+  Core atoms:
+    g_sym_nil            "NIL"
+    g_sym_t / g_sym_T    "T"             (same index; T is self-referential)
+    g_sym_quote          "quote"
+    g_sym_quasiquote     "quasiquote"
+    g_sym_unquote        "unquote"
+    g_sym_unquote_splicing "unquote-splicing"
+    g_sym_lambda         "lambda"
+    g_sym_macro          "macro"
+  Special vars:
+    g_sym_at             "@"
+    g_sym_args           "*args*"
+    g_sym_version        "*version*"
+  Control flow:
+    g_sym_if  g_sym_when  g_sym_unless  g_sym_cond  g_sym_and  g_sym_or
+  Sequencing:
+    g_sym_prog  g_sym_prog1  g_sym_prog2
+  Iteration:
+    g_sym_while  g_sym_loop  g_sym_for  g_sym_do
+  Binding:
+    g_sym_let  g_sym_letstar  g_sym_letrec  g_sym_letrecstar
+  Definition:
+    g_sym_setq  g_sym_de  g_sym_dm  g_sym_dmacro
+  Exceptions:
+    g_sym_case  g_sym_catch  g_sym_throw  g_sym_guard
+  List builders:
+    g_sym_make  g_sym_link  g_sym_chain
+  OOP / context:
+    g_sym_with  g_sym_recur
+
+  Additional symbols interned lazily by eval_init():
+    g_sym_parameterize   "parameterize"
+    g_sym_make_param     "make-parameter"
+    g_sym_this           "This"
+    g_sym_colon          ":"
+    g_sym_coloncolon     "::"
+    g_sym_setcolon       "=:"
+
+  T initialisation: g_syms[g_sym_T].value = MAKE_SYM(g_sym_T)
+
+
+================================================================================
+  PART IV -- READER (PARSER)
+================================================================================
+
+READER STRUCT
+─────────────
+  typedef struct Reader {
+      int  (*getc_fn)(void *ctx);
+      void (*ungetc_fn)(int c, void *ctx);
+      void *ctx;
+      int   line;   // 1-based current line number
+      int   col;    // current column number
+      union {
+          struct { FILE *f; }                               file_ctx;
+          struct { const char *s; size_t pos; size_t len; } str_ctx;
+      } u;
+  } Reader;
+
+  Initialise in-place (ctx points into the struct's own union):
+    reader_init_file(Reader *r, FILE *f)
+    reader_init_string(Reader *r, const char *s)
+
+  Do NOT use the by-value constructors reader_from_file / reader_from_string
+  for readers that outlive the calling function (ctx pointer becomes stale).
+
+  read_one(r)            → read one S-expr; return EOF_VAL at end
+  read_from_string(s)    → convenience: init from string, read one expr
+
+DYNAMIC BUFFER (internal)
+──────────────────────────
+  DynBuf: { char *data; size_t len; size_t cap; }
+  Grows by doubling from initial capacity 64.
+  Used for accumulating atom names and string literals character by character.
+
+SYNTAX
+──────
+
+  WHITESPACE / COMMENTS
+    Space, tab, CR, LF → skipped.
+    # followed by anything except backslash → line comment (consume to EOL).
+    ; anywhere → line comment (Scheme style, same behaviour).
+    NOTE: # followed by \ is NOT a comment -- it starts a character literal.
+
+  ATOMS (read by read_atom)
+    Accumulate characters until a delimiter: whitespace, (, ), ", ;, EOF.
+    Then classify:
+    - "NIL"                       → NIL_VAL
+    - "T"                         → MAKE_SYM(g_sym_T)
+    - [-]digit+                   → integer; if fits int32 → MAKE_INT;
+                                    else big_from_str (bignum promotion)
+    - Bare '-' (no digits follow) → symbol
+    - Anything else               → sym_intern → MAKE_SYM
+
+  CARET ESCAPE (inside atoms AND strings)
+    ^A..^Z → control chars 1–26   ^[ → 27   ^\ → 28   ^] → 29
+    ^^ → 30   ^_ → 31   ^a..^z → 1–26 (lowercase same as upper)
+    Unknown → pass through as-is.
+
+  STRING LITERALS  "..."
+    Escape sequences:
+      \n → newline     \t → tab      \r → carriage return
+      \\ → backslash   \" → double-quote
+      ^X → caret escape (see above)
+      \X (other) → X (literal, no error)
+    Result: str_intern → MAKE_STR.
+    Equal string literals produce the same Val.
+
+  CHARACTER LITERALS  #\x
+    # followed immediately by \ starts a character literal.
+    Read chars until delimiter:
+      One char: MAKE_STR of that one-char string.
+      "space"   → MAKE_STR(" ")
+      "tab"     → MAKE_STR("\t")
+      "newline" → MAKE_STR("\n")
+      "return"  → MAKE_STR("\r")
+      Other multi-char names → MAKE_STR of the whole name string.
+    Result type: TAG_STR (one-character interned string).
+
+  TRANSIENT SYMBOLS  |name with spaces|
+    Read characters until closing |.  Any bytes allowed (including spaces).
+    Result: sym_intern → MAKE_SYM.
+
+  LISTS  (...)
+    Read elements one by one with a forward-building tail-pointer.
+    Empty list () → NIL_VAL.
+    Dotted pair: (a . b) -- when a . is followed by a delimiter, read cdr
+                            expression and set CDR of last cell.
+    (. sym) -- when list is currently empty, return sym directly (used for
+              improper list tails / rest parameters).
+
+  READER MACROS
+    'x   → (quote x)
+    `x   → (quasiquote x)
+    ,x   → (unquote x)
+    ,@x  → (unquote-splicing x)
+
+  QUASIQUOTE EXPANSION  (recursive, depth-tracked)
+    Unquote ,expr   → evaluate and insert value.
+    Splicing ,@lst  → evaluate, splice all elements.
+    Nested `` increments depth; only innermost unquotes are expanded.
+
+
+================================================================================
+  PART V -- EVALUATOR
+================================================================================
+
+ENTRY POINT
+───────────
+  Val eval(Val expr, Val env)
+    env = lexical environment: alist of (symbol . value) cons pairs.
+    eval_toplevel(expr) = eval(expr, NIL_VAL)
+
+TCO MECHANISM
+─────────────
+  eval() is a single C function with one stack frame.
+  Tail calls use:
+    cur_expr = new_expression;
+    cur_env  = new_env;
+    goto tail_call;    // loops back to top of dispatch without C stack growth
+
+  Only the LAST form in a body uses TCO.
+  All preceding body forms use eval_body_non_tco() (recursive eval).
+
+  eval_body_non_tco(body, env):
+    Eval all but the last form normally (recursive eval).
+    Return the last form's value without TCO.
+    Used for non-tail positions.
+
+  eval_body(body, env):
+    Like eval_body_non_tco but TCO on last form (sets cur_expr/cur_env, goto).
+
+SCOPING MODEL
+─────────────
+  L uses TWO co-existing mechanisms:
+
+  ── DYNAMIC SCOPING (primary; PicoLisp-compatible) ──
+    Symbol lookup: check lexical env alist first; fall through to
+    g_syms[sym_idx].value (global/dynamic slot) on miss.
+    de and dm functions bind parameters by pushing BindFrames onto
+    g_bind_stack[], updating g_syms[sym_idx].value directly.
+    dynamic_bind(sym_idx, new_val) → push frame; update global; return old bind_top.
+    dynamic_unbind_to(mark)        → pop frames to mark; restore each sym's value.
+
+  ── LEXICAL SCOPING (lambda closures) ──
+    lambda captures the current env alist at the time of creation.
+    Lookup: the captured env alist is searched first; then global dynamic value.
+    let / let* / letrec / letrec* construct new alist entries.
+
+  SYMBOL LOOKUP ORDER:
+    1. Walk cur_env alist: CAR is the symbol Val; CDR is the value. Return CDR on match.
+    2. Fall through to g_syms[sym_idx].value.
+
+  KEY RULE: de functions set NIL_VAL (not the caller's env) as the base env for
+  their body.  This prevents accidental capture of the caller's lexical environment.
+  Parameters ARE added to de_env as an alist so that inner lambdas defined inside
+  de bodies can close over the de parameters correctly.
+
+CLOSURE FORMATS (stored as tagged cons lists)
+─────────────────────────────────────────────
+  Lambda closure:   (lambda  captured-env  params . body)
+    CAR = sym 'lambda';  CADR = env alist;  CADDR = params;  CDDDR = body.
+
+  de function:      (de  params . body)
+    CAR = sym 'de';  CDR = (params . body).
+
+  dm function:      (dm  params . body)
+    CAR = sym 'dm';  same layout as de.
+    At call site, arguments are NOT evaluated before binding.
+
+  Named macro:      (macro  NIL  params . body)
+    CAR = sym 'macro';  CADR = NIL;  CADDR = params;  CDDDR = body.
+    Arguments NOT evaluated before binding to params.
+
+  Parameter object: (parameter . current-value)
+    CAR = sym whose index == sym_parameter() (lazy-interned sentinel).
+    CDR = current value.
+    When called with 0 args: return CDR.  With 1 arg: set CDR; return arg.
+
+PARAMETER BINDING
+─────────────────
+  bind_params_env(params, args, base_env):
+    Pair each symbol in params with corresponding arg; build alist prepended to base_env.
+    If params ends in a bare symbol (improper list tail), bind that sym to remaining args.
+
+  bind_params_dynamic(params, args):
+    Push one BindFrame per positional param onto g_bind_stack[].
+    If params ends in a bare sym, bind it to remaining args.
+    Returns mark (saved g_bind_top) for later dynamic_unbind_to().
+
+APPLICATION DISPATCH
+────────────────────
+  When head is NOT a special form:
+    1. Evaluate head → fn.
+    2. If fn is (macro ...) → apply params to UNEVALUATED args; re-eval expansion.
+    3. Evaluate arg list → args.
+    4. If fn is PRIM            → g_prims[PRIM_IDX(fn)].fn(args, env)
+    5. If fn is (lambda ...)    → bind params lexically into new env; TCO body
+    6. If fn is (de ...)        → bind params dynamically; build de_env; TCO body
+    7. If fn is (dm ...)        → bind params dynamically (args NOT evaluated); eval body
+    8. If fn is (parameter . v) → 0 args: return CDR; 1 arg: set CDR, return arg
+    9. Otherwise                → pl_error("not a function", fn)
+
+RECUR
+─────
+  static Val g_recur_args = NIL_VAL;
+  static int  g_in_recur   = 0;
+
+  (recur arg ...) evaluates args, stores in g_recur_args, sets g_in_recur = 1.
+  After any de/dm/lambda body returns, the dispatch loop checks g_in_recur.
+  If set, rebind params to g_recur_args and loop body again (true TCO self-call).
+
+CATCH / THROW
+─────────────
+  typedef struct {
+      jmp_buf jb;
+      Val     tag;
+      Val     thrown_val;
+      int     bind_mark;      // g_bind_top saved at catch entry
+      int     gc_root_mark;   // g_gc_root_top saved at catch entry
+  } CatchFrame;
+
+  static CatchFrame g_catch_stack[CATCH_STACK_SIZE];   // CATCH_STACK_SIZE = 256
+  static int        g_catch_top = 0;
+
+  catch: setjmp; push CatchFrame with tag, bind_mark, gc_root_mark.
+         If setjmp returns 0: eval body; pop frame; return body result.
+         If setjmp returns nonzero (thrown): return frame.thrown_val.
+  throw: eval tag and val; search g_catch_stack backward for matching tag (pl_equal).
+         Restore g_bind_top and g_gc_root_top from frame; set thrown_val; longjmp.
+         If no matching handler: pl_error_str("throw: no matching catch").
+
+MAKE / LINK / CHAIN
+────────────────────
+  make: save old g_make_head/g_make_tail on C stack; reset to NIL_VAL; eval body;
+        restore; return the built list.
+
+  link: allocate new cons cell (car=val, cdr=NIL); if g_make_tail != NIL,
+        set CDR of g_make_tail to new cell; else set g_make_head = new cell;
+        update g_make_tail = new cell.
+
+  chain: splice entire list into accumulator: if g_make_tail != NIL, set its CDR
+         to lst; else g_make_head = lst; walk lst to find new g_make_tail.
+
+
+================================================================================
+  PART VI -- SPECIAL FORMS (35 total)
+================================================================================
+
+All special forms dispatch in eval() by comparing sidx (the head's symbol index)
+against well-known symbol globals.  TCO = uses goto tail_call on last expression.
+
+  (quote x)
+    Return x unevaluated.
+
+  (if cond then else?)
+    Eval cond.  If truthy: TCO on then.  Else: TCO on else (NIL if omitted).
+
+  (when cond . body)
+    Eval cond.  If truthy: eval body; TCO last form.  Returns NIL if cond false.
+
+  (unless cond . body)
+    Eval cond.  If falsy: eval body; TCO last form.  Returns NIL if cond true.
+
+  (cond clause ...)
+    Each clause: (test . body).  Eval tests in order.
+    First truthy test: eval body; TCO last form.
+    Clause (T . body) always matches (T is truthy).
+
+  (and expr ...)
+    Left-to-right.  Return NIL on first NIL.  TCO on last expr.
+    (and) → T.
+
+  (or expr ...)
+    Left-to-right.  Return first non-NIL.  TCO on last expr.
+    (or) → NIL.
+
+  (prog . body)
+    Eval all forms.  TCO on last form.
+
+  (prog1 first . rest)
+    Eval all; return first form's value.  No TCO.
+
+  (prog2 first second . rest)
+    Eval all; return second form's value.  No TCO.
+
+  (while test . body)
+    Eval test; if NIL exit; eval body; repeat.  Returns last body result.
+
+  (loop . body)
+    Infinite loop.  Only exits via throw/catch.
+
+  (for (var init step) test . body)
+    Dynamically bind var = (eval init).
+    Repeat: eval test; if NIL break; eval body; var ← (eval step).
+
+  (do ((var init step) ...) (test . result) . body)
+    Scheme-style.  Bind ALL vars to their inits simultaneously.
+    Each iteration: eval test; if truthy, eval result forms; TCO last.
+    If false: eval body; step ALL vars simultaneously; repeat.
+
+  (let ((var val) ...) . body)
+    Parallel lexical binding: eval all vals in current env; build new alist;
+    eval body in new env; TCO last form.
+
+  (let* ((var val) ...) . body)
+    Sequential lexical binding: each val eval sees previous bindings.
+    TCO last form.
+
+  (letrec ((var val) ...) . body)
+    Parallel recursive binding: extend env with all vars→NIL; eval all vals
+    in extended env; mutate bindings in-place; eval body; TCO last form.
+
+  (letrec* ((var val) ...) . body)
+    Sequential recursive binding: after each val eval, its binding is visible.
+    TCO last form.
+
+  (setq sym val)
+    Eval val.  If sym found in lexical alist: update that cell's CDR.
+    Otherwise: update g_syms[sym_idx].value.  Returns val.
+
+  (de name (params . rest?) . body)
+    Build closure (de params . body).  Store in g_syms[name].value.  Return closure.
+    rest?: bare symbol after positional params is bound to remaining args list.
+
+  (dm name (params . rest?) . body)
+    Same as de but args unevaluated at call site.  Closure: (dm params . body).
+
+  (dmacro name (params) . body)
+    Named macro.  Closure: (macro NIL params . body).  Args unevaluated at call.
+
+  (lambda params . body)
+    Lexical closure capturing cur_env.  Closure: (lambda cur_env params . body).
+
+  (macro params . body)
+    Anonymous macro.  Closure: (macro NIL params . body).
+
+  (case key-expr clause ...)
+    Eval key.  Clauses:
+      (val . body)        match if pl_equal(key, val)
+      ((v1 v2 ...) . body) match if pl_equal(key, any vi)
+      (T . body)          default
+    TCO on matching body's last form.
+
+  (catch tag . body)
+    Eval tag.  Push CatchFrame with setjmp.  Eval body.  On normal exit: pop frame.
+    On throw with matching tag: return thrown value (stacks already restored).
+
+  (throw tag val)
+    Eval tag and val.  Search catch stack backward; longjmp on match.
+
+  (guard (var clause ...) . body)
+    SRFI-34.  Eval body.  If exception: bind exception to var; eval cond clauses.
+    Matching clause → return result.  No match → re-throw.
+
+  (with obj . body)
+    Dynamically bind 'This' to (eval obj).  Eval body.  Restore This.
+
+  (make . body)
+    List accumulator.  Save/restore g_make_head/g_make_tail.  Eval body.
+    Return accumulated list.
+
+  (link val)
+    Append (eval val) to current make list.  O(1).
+
+  (chain lst)
+    Splice (eval lst) into current make list.
+
+  (quasiquote tmpl)
+    Expand template: recurse; eval (unquote x); splice (unquote-splicing x).
+
+  (recur arg ...)
+    Signal self tail-call.  Eval args; store in g_recur_args; set g_in_recur.
+
+  (parameterize ((p v) ...) . body)
+    Save each parameter's current value; set to new value; eval body; restore.
+    Restoration happens even if body throws.
+
+  PROPERTY SHORTHAND (key is NOT evaluated; 'This' is implicit)
+  (: key)         → get property key from This
+  (:: key)        → get the (key . val) cons cell from This's plist
+  (=: key expr)   → eval expr; put result as property key on This
+
+
+================================================================================
+  PART VII -- PRIMITIVES
+================================================================================
+
+Signature:   Val fn(Val args, Val env)
+  args = pre-evaluated argument list (proper list of Vals)
+  env  = current lexical environment (rarely needed)
+
+Registration: prim_register(name, fn, min_args, max_args)
+  min_args / max_args = -1 means variadic / unlimited.
+  Stores PrimDef in g_prims[g_prim_count++]; sets symbol value to MAKE_PRIM(idx).
+
+LIST AND CELL PRIMITIVES
+────────────────────────
+  (cons a b)             → new cons cell
+  (car v)                → CAR of cons
+  (cdr v)                → CDR of cons
+  (cadr v)               → CAR(CDR(v))
+  (caddr v)              → CAR(CDR(CDR(v)))
+  (cdddr v)              → CDR(CDR(CDR(v)))
+  (set-car cell v)       → mutate car; return v
+  (set-cdr cell v)       → mutate cdr; return v
+  (list . args)          → build proper list from evaluated args
+  (list* a . rest)       → last rest element becomes CDR tail
+  (append l1 l2)         → concatenate; l2 shares structure
+                           IMPORTANT: takes EXACTLY 2 args; 3rd+ silently ignored
+  (nconc l1 l2)          → destructive concatenate; mutates CDR of l1's last cell
+  (reverse lst)          → new reversed copy
+  (length lst)           → number of cons cells
+  (last lst)             → last cons cell (not its CAR)
+  (nth n lst)            → nth element (0-based)
+  (nthcdr n lst)         → nth CDR (0-based)
+  (member x lst)         → first tail where CAR equals x (val_equal); NIL if absent
+  (memq x lst)           → first tail where CAR is x (identity eq); NIL if absent
+  (assoc key alist)      → first pair where CAR equals key (val_equal)
+  (assq key alist)       → first pair where CAR is key (identity eq)
+  (filter pred lst)      → list of elements where (pred elem) is truthy
+  (remove pred lst)      → list of elements where (pred elem) is NIL
+  (mapcar fn lst)        → list of (fn elem) results
+  (mapc fn lst)          → like mapcar but for side effects; returns lst
+  (apply fn lst)         → call fn with lst elements as args
+  (funcall fn . args)    → call fn with explicit args
+
+PREDICATE PRIMITIVES
+────────────────────
+  (null v)   (null? v)    → T if NIL
+  (atom v)   (atom? v)    → T if not a cons cell
+  (pair v)   (pair? v)    → T if cons cell
+  (listp v)  (list? v)    → T if NIL or cons cell
+  (numberp v)(number? v)  → T if INT or BIG
+  (stringp v)(string? v)  → T if STR
+  (symbolp v)(symbol? v)  → T if SYM
+  (vec? v)                → T if VEC
+  (big? v)                → T if BIG
+  (eq a b)   (eq? a b)    → T if Val bitpatterns are identical
+  (equal a b)(equal? a b) → T if structurally equal (recursive)
+  (= a b)                 → T if numerically equal
+  (< a b)  (> a b)  (<= a b)  (>= a b) → numeric comparisons
+  (not v)                 → T if NIL, else NIL
+  (bound? sym)            → T if symbol's global value is not NIL
+
+ARITHMETIC PRIMITIVES
+─────────────────────
+  All dispatch transparently over INT and BIG.
+  int32 overflow auto-promotes to bignum.
+  Arithmetic helpers: pl_add  pl_sub  pl_mul  pl_div  pl_mod  pl_rem  pl_cmp
+
+  (+  . args)             → variadic sum; 0 args → 0
+  (-  a . rest)           → a - each rest; (- a) → negate
+  (*  . args)             → variadic product; 0 args → 1
+  (/  a b)                → truncated integer division
+  (mod a b)               → floored modulo (result sign follows b)
+  (rem a b)               → truncating remainder (result sign follows a)
+  (** a b) (expt a b)     → integer exponentiation
+  (abs a)                 → absolute value
+  (max a . rest)          → maximum
+  (min a . rest)          → minimum
+  (1+ a)  (inc a)         → add 1
+  (1- a)  (dec a)         → subtract 1
+  (gcd a b)               → greatest common divisor
+  (lcm a b)               → least common multiple
+
+BITWISE PRIMITIVES
+──────────────────
+  (bitand a b)    → AND
+  (bitor  a b)    → OR
+  (bitxor a b)    → XOR
+  (bitnot a)      → one's complement NOT
+  (>> a n)        → arithmetic right shift by n
+  (<< a n)        → left shift by n
+  (bit? a n)      → T if bit n is set in a
+  (bitmask n)     → integer with low n bits all set to 1
+
+BIGNUM PRIMITIVES
+─────────────────
+  (big v)         → coerce INT to bignum
+  (big? v)        → T if v is a bignum
+
+STRING AND SYMBOL PRIMITIVES
+─────────────────────────────
+  (name sym)           → string containing the symbol's name
+  (intern str)         → symbol with that name (interned)
+  (str v)              → readable string representation (like write-to-string)
+  (sym v)              → intern str's repr as a symbol
+  (pack lst)           → concatenate list of strings into one string
+  (unpack str)         → list of one-character strings
+  (upcase str)         → uppercase copy
+  (downcase str)       → lowercase copy
+  (trim str)           → strip leading and trailing whitespace
+  (ltrim str)          → strip leading whitespace
+  (rtrim str)          → strip trailing whitespace
+  (sub str start end?) → substring; start 0-based; end exclusive (optional)
+  (index needle haystack) → 0-based position; NIL if absent
+  (replace str old new)   → replace first occurrence of old with new
+  (format n scale?)    → format INT as string; scale inserts decimal point
+  (fmt template . args) → ~A=prin ~S=print ~%=newline ~~=tilde
+
+CHARACTER PRIMITIVE
+───────────────────
+  (char v)    → if v is INT: 1-char string from codepoint; if STR: 1-char str
+
+I/O PRIMITIVES
+──────────────
+  (prin . args)           → raw output of each arg (no quotes); return last
+  (print . args)          → readable output (with quotes); return last
+  (prinl . args)          → raw output + newline
+  (println . args)        → readable output + newline
+  (write v)               → readable output to stdout
+  (read)                  → read one S-expr from stdin
+  (read-from-string s)    → parse one S-expr from string
+  (read-line)             → read one line from stdin; return string
+  (read-all-lines path)   → list of all lines from file (one L entry per
+                            file line regardless of line length)
+  (write-lines path lst)  → write list of strings as lines to file
+  (read-char)             → one-character string or NIL at EOF
+  (write-char s)          → write first char of s to stdout
+  (eof? handle?)          → T if at EOF on current input
+  (flush)                 → flush g_current_output
+  (open path mode)        → open file; mode "r"/"w"/"a"; return handle INT
+  (close handle)          → close file handle
+  (in path . body)        → eval body with stdin redirected from file
+  (out path . body)       → eval body with stdout redirected to file
+  (load path)             → load and eval Lisp file
+
+JSON PRIMITIVES
+───────────────
+  (json-encode v)    → JSON string
+  (json-decode s)    → parse JSON; objects → alist; arrays → list;
+                        integers → INT; strings → STR; true/false/null → T/NIL/NIL
+
+TIME PRIMITIVES
+───────────────
+  (time)         → INT milliseconds since Unix epoch
+  (date t?)      → "YYYY-MM-DD" string; or (year month day) list if T arg given
+  (clock t?)     → "HH:MM:SS" string; or (h m s) list if T arg given
+  (usec)         → bignum microseconds since Unix epoch
+
+SORTING AND AGGREGATION
+───────────────────────
+  (sort lst pred?)   → sorted copy; pred(a,b) returns T if a < b; default pl_cmp
+  (maxi lst key?)    → element with maximum value; optional 1-arg key function
+  (mini lst key?)    → element with minimum value; optional 1-arg key function
+
+RANDOM NUMBERS
+──────────────
+  (rand)             → random INT in [0, INT32_MAX]
+  (rand max)         → random INT in [0, max)
+  (rand min max)     → random INT in [min, max)
+  (seed n)           → seed the RNG with integer n
+
+FUNCTIONAL UTILITIES
+────────────────────
+  (identity x)       → x
+  (constantly x)     → closure returning x regardless of args
+  (compose f g)      → (lambda (x) (f (g x)))
+  (gensym)           → fresh unique symbol e.g. #g42
+
+ENVIRONMENT PRIMITIVES
+──────────────────────
+  (val sym)          → g_syms[SYM_IDX(sym)].value (global/dynamic slot)
+  (set sym v)        → g_syms[SYM_IDX(sym)].value = v; return v
+  (bound? sym)       → T if sym's global value is not NIL
+  (eval expr)        → evaluate expr in empty lexical env
+
+SPECIAL VARIABLES
+─────────────────
+  *args*             → list of command-line argument strings (built at startup)
+  *version*          → string "lispIsPerfect9-1.0"
+  *os*               → string "windows" or "posix"
+  space              → " "     tab → "\t"     newline → "\n"
+
+PROPERTY LIST PRIMITIVES
+────────────────────────
+  Plist format: alist ((key . val) ...) stored in SymSlot.plist.
+  Keys compared with val_equal (structural equality).
+
+  (put sym key val)   → search plist for key; if found, update CDR in-place;
+                        else prepend (key . val); return val.
+  (get sym key)       → search plist; return val or NIL if absent.
+  (prop sym key)      → return the (key . val) cons cell (NIL if absent).
+                        The live cell can be mutated via set-cdr.
+  (plist sym)         → return the entire plist alist.
+
+  SHORTHAND (special forms; key is literal symbol; 'This' implicit):
+  (: key)             → (get This key)
+  (:: key)            → (prop This key)
+  (=: key val-expr)   → (put This key (eval val-expr))
+
+MUTABLE VECTOR PRIMITIVES
+─────────────────────────
+  (vec size init?)    → new vector; size elements; each = init (default NIL)
+  (vec-get v idx)     → element at 0-based idx
+  (vec-set v idx val) → set element; return val
+  (vec-length v)      → element count
+  (vec-push v val)    → append val (amortised O(1)); return v
+  (vec? v)            → T if vector
+
+MAKE / LINK / CHAIN PRIMITIVES
+───────────────────────────────
+  These are evaluated as special forms, not regular function calls, but also
+  registered as primitives for completeness.
+  Use ONLY inside a (make ...) body.
+
+  (link val)          → append val to accumulator; O(1) via tail pointer
+  (chain lst)         → splice entire lst into accumulator
+
+PARAMETER OBJECT PRIMITIVE
+──────────────────────────
+  (make-parameter init)   → creates (parameter . init); a callable closure:
+                             () → get current value
+                             (v) → set current value; return v
+
+HASH PRIMITIVE
+──────────────
+  (hash val nbits)    → FNV-1a hash of val's printed representation, masked to nbits.
+                        nbits in [1, 32].  Returns INT.
+
+WEIGHT-BALANCED TREE (lib/rope.l + C primitive)
+───────────────────────────────────────────────
+  Node format: (wbt count left val right) -- five cons cells per node.
+  wbt-count, wbt-get, wbt-set, wbt-insert, wbt-delete are all O(log n).
+
+  (wbt-from-list lst)   → balanced WBT built in C from a list (~10x faster
+                          than the equivalent L recursion -- the per-call
+                          interpreter overhead for env alists dominates
+                          when building 1M+ nodes).  Used by the vi editor
+                          for its line buffer.
+  (wbt-to-list tree)    → in-order traversal back to a list.
+
+
+================================================================================
+  PART VIII -- BIGNUM
+================================================================================
+
+BACKENDS
+────────
+  HAVE_LIBBF:   Links libbf; arbitrary precision; all operations exact.
+  Default:      int64_t per slot; overflow is undefined behaviour.
+                Use HAVE_LIBBF for correct arbitrary-precision arithmetic.
+
+POOL
+────
+  BigSlot g_bignums[BIG_POOL_SIZE];   // BIG_POOL_SIZE = 65,536
+  uint32_t g_big_count = 0;
+  uint32_t g_big_free_head;
+
+  Allocation: freelist first; bump g_big_count if empty; run GC if bump exhausted.
+  New bignums created with mark=1 to survive allocation-time GC.
+  GC clears all bignum marks before the mark phase; unreachable ones collected.
+
+NORMALIZATION
+─────────────
+  big_normalize(v): if value fits in int32_t, demote to MAKE_INT and return.
+  All arithmetic functions normalize before returning.
+
+ARITHMETIC API  (declared in picolisp.h)
+─────────────────────────────────────────
+  Val big_from_int64(int64_t n)
+  Val big_from_str(const char *s, int base)
+  Val big_add(Val a, Val b)        Val big_sub(Val a, Val b)
+  Val big_mul(Val a, Val b)        Val big_div(Val a, Val b)
+  Val big_mod(Val a, Val b)        Val big_rem(Val a, Val b)
+  Val big_pow(Val a, Val b)        Val big_abs(Val a)
+  Val big_neg(Val a)
+  int big_cmp(Val a, Val b)        // -1 / 0 / +1
+  Val big_normalize(Val v)
+  Val to_big(Val v)                // coerce INT to BIG
+  char *big_to_str(Val v)          // heap-allocated decimal string (caller frees)
+  bool big_is_zero(Val v)
+  bool big_is_neg(Val v)
+  Val big_bitand(a,b)  big_bitor(a,b)  big_bitxor(a,b)  big_bitnot(a)
+  Val big_shl(Val a, int n)        Val big_shr(Val a, int n)
+
+TRANSPARENT ARITHMETIC HELPERS  (dispatch INT vs BIG automatically)
+────────────────────────────────────────────────────────────────────
+  Val pl_add(Val a, Val b)   Val pl_sub(Val a, Val b)   Val pl_mul(Val a, Val b)
+  Val pl_div(Val a, Val b)   Val pl_mod(Val a, Val b)   Val pl_rem(Val a, Val b)
+  int pl_cmp(Val a, Val b)   // -1 / 0 / +1
+  Val pl_max(Val a, Val b)   Val pl_min(Val a, Val b)
+  Val pl_abs(Val v)          Val pl_neg(Val v)
+
+
+================================================================================
+  PART IX -- PRINTER
+================================================================================
+
+  pl_print(v, port)    readable: strings with " and escapes; symbols as names
+  pl_prin(v, port)     raw: strings without quotes; symbols as names
+  pl_println(v, port)  pl_print + newline
+  pl_prinl(v, port)    pl_prin + newline
+  char *val_to_str(v)  heap-allocated readable string (caller must free)
+
+PORT ABSTRACTION
+────────────────
+  typedef struct {
+      void (*putc_fn)(int c, void *ctx);
+      void (*puts_fn)(const char *s, void *ctx);   // optional bulk-write path
+      void *ctx;
+  } Port;
+
+  make_file_port(f)        → Port backed by FILE* (wires fputc + fputs)
+  make_buf_port(buf, len)  → Port that writes into a heap-allocated C string
+                             (puts_fn NIL; port_puts falls back to per-char)
+
+  port_puts uses puts_fn when present; ~10x speedup for full-string writes
+  (the vi terminal renderer issues many per-frame).
+
+  g_stdout_port, g_stderr_port  -- standard ports (file_ctx = stdout / stderr)
+  g_current_output              -- active output port (default: &g_stdout_port)
+  g_current_reader              -- active reader (NULL when no file is loading)
+
+CYCLE DETECTION
+───────────────
+  8192-slot hash set inside the printer.  If a cons cell is seen twice,
+  print "#<cycle>" instead of recursing infinitely.
+
+TYPE RENDERING
+──────────────
+  NIL           → "NIL"
+  INT           → decimal integer string
+  SYM (T)       → "T";  other SYM → symbol name
+  STR readable  → "..." with \n \t \r \\ \" escapes;  raw → bytes directly
+  CONS          → "(a b c)" or "(a . b)"; closures NOT special-cased (printed readable)
+  PRIM          → "#<primitive name>"
+  BIG           → decimal via big_to_str()
+  VEC           → "#<vec N>"  where N = length
+  CORO          → "#<coro N>" where N = g_coros[] index
+  PIPE          → "#<pipe N>"
+
+
+================================================================================
+  PART X -- COROUTINES
+================================================================================
+
+Coroutines are always available (built-in, no external dependency).
+
+POOL
+────
+  Coro g_coros[CORO_POOL_SIZE];   // CORO_POOL_SIZE = 4096
+  uint32_t g_coro_count = 0;
+  uint32_t g_cur_coro   = UINT32_MAX;   // UINT32_MAX = main thread is running
+
+CORO STRUCT
+───────────
+  typedef struct {
+      void      *fiber;              // HANDLE (Win Fibers) or PosixCoroCtx* (POSIX)
+      Val        send_val;           // value sent in via co-resume
+      Val        yield_val;          // value yielded out or final return value
+      int        alive;              // 1 = running/suspended; 0 = finished
+      Val        fn;                 // Lisp function (GC root)
+      int        gc_root_base;       // g_gc_root_top at time of last resume
+      Val       *saved_gc_roots;     // malloc'd snapshot; NULL while running
+      int        saved_gc_root_count;
+      int        bind_base;          // g_bind_top at time of last resume
+      BindFrame *saved_binds;        // malloc'd snapshot; NULL while running
+      int        saved_bind_count;
+      uint32_t   caller_coro_idx;    // UINT32_MAX = main; else g_coros[] index
+                                     // set by co-resume; read by yield/finish
+  } Coro;
+
+PRIMITIVES
+──────────
+  (co fn)
+    Allocate g_coros[g_coro_count++]; set alive=1; store fn.
+    Windows: CreateFiber(0, coro_fiber_fn, (LPVOID)(uintptr_t)idx).
+    POSIX:   malloc PosixCoroCtx + stack (512 KB); getcontext; makecontext.
+    Return MAKE_CORO(idx).  Does NOT start execution.
+
+  (yield val)
+    Inside a coroutine only.  Set c->yield_val = val.
+    Call coro_save_stacks(c): snapshot gc_roots and bind_stack slices.
+    Set g_cur_coro = c->caller_coro_idx.
+    Windows: SwitchToFiber(coro_caller_fiber(c->caller_coro_idx)).
+    POSIX:   swapcontext(my_ucontext, caller_ucontext).
+    On resume: return c->send_val.
+
+  (co-resume coro val)
+    If coro not alive: return NIL immediately.
+    c->caller_coro_idx = g_cur_coro.
+    c->send_val = val.
+    Call coro_restore_stacks(c): restore gc_roots and bind_stack slices.
+    my_idx = g_cur_coro; g_cur_coro = idx.
+    Windows: SwitchToFiber(c->fiber).
+    POSIX:   swapcontext(get_ucontext(my_idx), get_ucontext(idx)).
+    After switch returns (coro yielded or finished):
+      if !alive: Windows: DeleteFiber; POSIX: free stack + PosixCoroCtx.
+    Return c->yield_val.
+
+  (co-alive? v)
+    If IS_CORO(v) and g_coros[CORO_IDX(v)].alive == 1: return T_VAL.
+    Otherwise (including NIL, INT, or dead coro): return NIL_VAL.
+
+GC SAFETY -- STACK SNAPSHOTS
+────────────────────────────
+  coro_save_stacks(c):
+    Count = g_gc_root_top - c->gc_root_base.
+    Malloc and memcpy g_gc_roots[gc_root_base..gc_root_top) → c->saved_gc_roots.
+    g_gc_root_top = c->gc_root_base.
+    Count = g_bind_top - c->bind_base.
+    Malloc and memcpy g_bind_stack[bind_base..bind_top) → c->saved_binds.
+    g_bind_top = c->bind_base.
+
+  coro_restore_stacks(c):
+    c->gc_root_base = g_gc_root_top.
+    Memcpy saved_gc_roots back to g_gc_roots[gc_root_top..].
+    g_gc_root_top += saved count.
+    Free saved_gc_roots; set NULL.
+    c->bind_base = g_bind_top.
+    Memcpy saved_binds back; update g_bind_top.
+    Free saved_binds; set NULL.
+
+  gc_mark_coros():
+    For each g_coros[i] where alive==1:
+      gc_mark_val(c->fn); gc_mark_val(c->send_val); gc_mark_val(c->yield_val).
+      If saved_gc_roots != NULL: gc_mark_val each.
+      If saved_binds != NULL: gc_mark_val each saved BindFrame's saved value.
+
+CALLER TRACKING (enables pipelines)
+─────────────────────────────────────
+  co-resume saves g_cur_coro into c->caller_coro_idx before switching.
+  yield and coro_fiber_fn/coro_entry switch to get_ucontext(caller_coro_idx).
+  This means coroutine A can call (co-resume B ...); when B yields, control
+  returns to A (not to main).
+
+WINDOWS FIBER DETAILS
+──────────────────────
+  static LPVOID g_main_fiber = NULL;
+  uv_io_init(): g_main_fiber = ConvertThreadToFiber(NULL) if not already a fiber.
+  coro_caller_fiber(idx): idx==UINT32_MAX → g_main_fiber; else g_coros[idx].fiber.
+  coro_fiber_fn(LPVOID arg): runs pl_apply(c->fn, list(c->send_val));
+    sets alive=0; sets c->yield_val to return value; SwitchToFiber(caller).
+  prim_co: lazy ConvertThreadToFiber; CreateFiber(0, coro_fiber_fn, idx_ptr).
+  prim_yield: coro_save_stacks; g_cur_coro=caller; SwitchToFiber(caller_fiber).
+  prim_co_resume: save caller; restore stacks; g_cur_coro=idx; SwitchToFiber(c->fiber).
+    After switch: if !alive, DeleteFiber(c->fiber); c->fiber=NULL.
+    Return c->yield_val.
+
+POSIX UCONTEXT DETAILS
+────────────────────────
+  #define CORO_STACK_SIZE (512 * 1024)   // 512 KB per coroutine
+  typedef struct { ucontext_t ctx; void *stack; } PosixCoroCtx;
+  static ucontext_t g_main_ctx;
+  get_ucontext(idx): idx==UINT32_MAX → &g_main_ctx; else &((PosixCoroCtx*)fiber)->ctx.
+  coro_entry(int idx_i): calls pl_apply; sets alive=0; sets yield_val;
+    swapcontext(my_ctx, get_ucontext(caller_coro_idx)).
+  prim_co: malloc PosixCoroCtx; malloc stack;
+    getcontext; uc_stack.ss_sp=stack; uc_stack.ss_size=CORO_STACK_SIZE; uc_link=NULL;
+    makecontext(&pctx->ctx, coro_entry, 1, (int)idx).
+  prim_yield: coro_save_stacks; swapcontext(get_ucontext(idx), get_ucontext(caller)).
+  prim_co_resume: save caller; my_idx=g_cur_coro; restore stacks; g_cur_coro=idx;
+    swapcontext(get_ucontext(my_idx), get_ucontext(idx)).
+    After switch: if !alive, free stack; free pctx; c->fiber=NULL.
+    Return c->yield_val.
+
+USAGE PATTERNS
+──────────────
+  Infinite generator:
+    (de integers-from (n)
+      (co (lambda (_)
+        (let ((i n))
+          (while T (yield i) (setq i (1+ i)))))))
+
+  (take 10 (integers-from 0))    ; → (0 1 2 3 4 5 6 7 8 9)
+
+  CORRECT drain of a FINITE generator (prime-and-pump):
+    (let ((v (co-resume gen NIL)) (result NIL))
+      (while (co-alive? gen)
+        (setq result (cons v result))
+        (setq v (co-resume gen NIL)))
+      (reverse result))
+
+  WRONG (includes body's NIL return value as last element):
+    (let ((result NIL))
+      (while (co-alive? gen)
+        (setq result (cons (co-resume gen NIL) result)))
+      (reverse result))
+
+  Pipeline (coro A resuming coro B; B's yield returns to A):
+    Works automatically via caller_coro_idx tracking.
+
+
+================================================================================
+  PART XI -- ASYNC I/O (native platform backends)
+================================================================================
+
+Built-in on all platforms.  No external dependencies.
+POSIX: poll(2) event loop in src/native_io_posix.c
+Windows: WSAPoll event loop in src/native_io_win32.c
+
+EVENT LOOP
+  (event-loop)  (uv-run)  → polls sockets, fires timers, checks async HTTP
+
+TCP
+  (tcp-connect host port callback)   callback(err fd) on connect
+  (tcp-listen port callback)         callback(err fd) on accept;
+                                     callback(err fd data) on data;
+                                     callback(err fd NIL) on close
+  (tcp-write fd data)                send string data on fd
+  (tcp-close fd)                     close connection
+
+TIMER
+  (timer ms callback)                one-shot; callback() after ms milliseconds
+
+FILE I/O
+  (file-read path callback)          callback(err data-string)
+  (file-write path data callback)    callback(err)
+
+HTTP CLIENT  (via worker thread; callback on main event loop)
+  (http-get url callback)            url "http://host:port/path"
+                                     callback(err status body)
+  (http-post url data callback)      data is string body
+
+HTTP SERVER  (implemented in lib/http.l on top of tcp-listen)
+  (http-serve port handler)          handler(method path body)
+                                     returns string (200 text/plain) or
+                                     (status headers-alist body)
+
+WEBSOCKET  (implemented in lib/websocket.l)
+  (ws-handshake fd key)              send 101 Switching Protocols
+  (ws-parse-frame data)              → (opcode payload) or NIL
+  (ws-build-frame payload)           → binary frame string
+  (ws-build-close)                   → close frame
+  (ws-build-pong payload)            → pong frame
+
+AUDIO SCHEDULING (Sam Aaron temporal model)
+  (audio-time)                       → current mixer position in ms
+  (audio-at time-ms 'sample [speed]) → schedule sample at absolute time
+
+
+================================================================================
+  PART XII -- SUBPROCESS / PIPES (native platform backends)
+================================================================================
+
+  (spawn cmd . args)         → start subprocess; return pipe handle
+  (pipe-read-all handle)     → read all stdout; return string
+  (pipe-write handle data)   → write string to stdin
+  (pipe-close-stdin handle)  → close subprocess stdin
+  (pipe-close handle)        → close pipe; return exit code INT
+  (pipe-alive? handle)       → T if subprocess running
+
+
+================================================================================
+  PART XIII -- FFI (ffi.c)
+================================================================================
+
+BACKENDS
+  HAVE_FFI:   libffi; all type codes including "d" (double) on all platforms.
+  Windows:    Built-in x64 ABI direct-call; integer types only; no double.
+
+PRIMITIVES
+  (native lib func ret-type [arg-type arg-val] ...)
+    lib      = string path or NIL (current process)
+    func     = string C function name
+    ret-type = type code
+    Alternating [arg-type arg-val] pairs for each argument.
+
+  (ffi-open path)   → pre-load shared library; cache handle (up to 64 cached)
+
+TYPE CODES (string or symbol)
+  "v" / v    void (return only)
+  "i" / i    int32_t
+  "l" / l    int64_t
+  "d" / d    double (libffi only)
+  "s" / s    char* (L string ↔ C string)
+  "p" / p    void* (L INT as address ↔ C pointer)
+
+
+================================================================================
+  PART XIV -- GRAPHICS AND AUDIO (native platform backends)
+================================================================================
+
+NATIVE GRAPHICS (Win32 GDI / Xlib -- no SDL)
+  API names retain "sdl-" prefix for backward compatibility.
+  (sdl-window title w h)      create native window
+  (sdl-color r g b)           set draw color
+  (sdl-clear)                 clear backing pixmap
+  (sdl-present)               blit to window
+  (sdl-point x y)             draw point
+  (sdl-line x1 y1 x2 y2)     draw line
+  (sdl-rect x y w h)          rectangle outline
+  (sdl-fill x y w h)          filled rectangle
+  (sdl-circle x y r)          circle outline
+  (sdl-fill-circle x y r)     filled circle
+  (sdl-ticks)                 monotonic ms
+  (sdl-delay ms)              sleep
+  (sdl-poll)                  next event alist or NIL
+  (sdl-wait-event)            blocking event read
+  (sdl-key-name code)         string key name
+  (sdl-quit)                  close window
+
+FONT RENDERING (built-in TTF rasterizer -- no SDL_ttf)
+  src/ttf.c: minimal TrueType parser + scanline rasterizer with
+  4× supersampled antialiasing.  Supports composite glyphs.
+  (sdl-font-load path size)   load TTF font file
+  (sdl-text x y str)          draw text with loaded font
+  (sdl-text-size str)         (width . height) cons pair
+
+AUDIO (WASAPI on Windows / ALSA on Linux -- no SDL)
+  Background voice mixer thread: 32 concurrent voices, 20ms chunks.
+  Supports ahead-of-time scheduling via audio-at (Sam Aaron model).
+  (audio-init)                init audio device + start mixer thread
+  (audio-quit)                stop mixer + close device
+  (audio-tone wave freq dur [vol])
+    wave: 0=sine 1=square 2=sawtooth 3=triangle.
+    freq: Hz.  dur: ms.  vol: 0-100 (default 50).
+  (audio-drums mask dur)      drum synthesis (bitmask: 1=kick 2=snare 4=hat 8=ohat)
+  (audio-time)                current mixer output position in ms
+  (audio-at time-ms 'sample [speed])  schedule at absolute mixer time
+  (audio-pending)             number of active voices
+  (audio-volume pct)          set master volume (0-100)
+  (audio-stop-all)            silence all voices
+  (audio-clear)               reset audio device
+
+SAMPLE PLAYBACK
+  (sample-load 'name "path")  load WAV file as named sample
+  (samples-load-dir "dir")    load all WAV files from directory (count returned)
+  (sample-play 'name [speed]) play sample (adds voice to mixer)
+  (sample-flush)              no-op (mixer is continuous)
+TINYGL 3D GRAPHICS (optional -- requires deps/tinygl/)
+  (tgl-init w h)              initialise TinyGL framebuffer
+  (tgl-clear)  (tgl-present)
+  (tgl-viewport x y w h)
+  (tgl-frustum l r b t n f)  (tgl-ortho l r b t n f)
+  (tgl-matrix-mode mode)
+  (tgl-load-identity)  (tgl-push-matrix)  (tgl-pop-matrix)
+  (tgl-rotate angle x y z)  (tgl-translate x y z)  (tgl-scale x y z)
+  (tgl-color r g b)           values in [0.0, 1.0] as scaled integers
+  (tgl-begin mode)            POINTS LINES TRIANGLES TRIANGLE_STRIP etc.
+  (tgl-vertex x y z)
+  (tgl-end)
+  (tgl-enable cap)  (tgl-disable cap)   DEPTH_TEST LIGHTING etc.
+
+
+================================================================================
+  PART XV -- INITIALIZATION ORDER
+================================================================================
+
+main() call sequence:
+
+  1. heap_init()                  commit HEAP_INIT_CELLS; build freelist
+  2. sym_init()                   intern well-known symbols; init T; set up I/O ports
+  3. bignum_init()                init bignum pool; open bf_context if HAVE_LIBBF
+  4. prims_init()                 register all primitives (incl. float, math, sha1, base64)
+  5. eval_init()                  intern special form symbols
+  6. coro_init()                  init coroutine pool (Win Fibers / POSIX ucontext)
+     coro_prims_register()        co, co-resume, yield, co-alive?
+  7. io_init()                    init native event loop (WSAStartup on Win)
+     io_prims_register()          tcp-*, timer, file-*, event-loop, http-get/post
+  8. pipe_prims_register()        spawn, pipe-*
+  9. ffi_prims_register()         native, ffi-open, ffi-callback
+ 10. gfx_prims_register()         sdl-*, audio-*, sample-*, audio-time, audio-at
+ 11. [HAVE_TINYGL] tinygl_prims_register() tgl-*
+ 12. Load lib/stdlib.l if the file exists
+ 13. Build *args* list from argc/argv
+ 14. Parse command line:
+       -e "expr"    → eval one expression; print result; set ran_something
+       filename     → load_file(path); set ran_something
+       --           → end of interpreter flags
+ 15. If !ran_something → REPL
+
+REPL
+  print "> "; read_one(stdin); eval; pl_println(result); repeat until EOF.
+
+LOAD FILE
+  fopen; reader_init_file; loop: read_one; PUSH_ROOT(expr); eval; POP_ROOT; until EOF.
+
+pl_error(msg, irritant)  → print to stderr; exit(1).
+pl_error_str(msg)        → print to stderr; exit(1).
+
+
+================================================================================
+  PART XVI -- BUILD SYSTEM
+================================================================================
+
+SOURCE FILES
+  src/main.c            Entry point, REPL, load_file, pl_error
+  src/picolisp.h        Master header -- ALL translation units include this
+  src/msvc_compat.h     MSVC shims (ssize_t, strndup, __attribute__ stubs)
+  src/heap.c            Cell pool, GC mark-sweep, vector pool, bind stack defs
+  src/sym.c             Symbol/string intern tables, well-known symbols, I/O ports
+  src/reader.c          S-expression parser
+  src/eval.c              Evaluator: special forms, TCO, closures, destructuring
+  src/print.c             Printer: pl_print, pl_prin, val_to_str
+  src/prims.c             All built-in primitives (160+)
+  src/bignum.c            Bignum + float pool and arithmetic (libbf or int64_t)
+  src/coro.c              Coroutines (Win Fibers / POSIX ucontext)
+  src/native_io_win32.c   Event loop, TCP, HTTP, timers (Windows)
+  src/native_io_posix.c   Event loop, TCP, HTTP, timers (POSIX)
+  src/native_gfx_win32.c  Graphics, audio, samples (Win32 GDI + WASAPI)
+  src/native_gfx_x11.c    Graphics, audio, samples (Xlib + ALSA)
+  src/ttf.c               TrueType font parser + scanline rasterizer
+  src/pipe_win32.c        Subprocess spawning (Windows)
+  src/pipe_posix.c        Subprocess spawning (POSIX)
+  src/ffi.c               Foreign function interface (libffi / Win x64 ABI)
+  src/callbacks.c         FFI callback support
+  src/tinygl_bridge.c     TinyGL software 3D graphics (optional)
+  src/term_helper.c       Raw terminal mode helper (DLL/SO).  Installs an
+                          atexit + signal handler so cooked mode + cursor +
+                          alt-screen are restored on any exit path.
+
+  lib/stdlib.l            Standard library loader
+  lib/string.l            String utilities (split, join, etc.)
+  lib/math.l              Integer math helpers
+  lib/ds.l                Persistent data structures (HAMT maps, vectors)
+  lib/rope.l              Weight-balanced binary tree (WBT) for line buffers
+                          -- O(log n) random access / insert / delete.  See
+                          wbt-from-list (C primitive in prims.c, ~10x faster
+                          than an L-level balanced build).
+  lib/http.l              HTTP server (pure L on tcp-listen)
+  lib/websocket.l         WebSocket protocol (RFC 6455)
+  lib/livecode.l          Sam Aaron temporal scheduling for live coding
+
+  demos/vi/               Vi-flavoured editor (terminal + native gfx).
+                          See Part XIX for the feature matrix.
+
+COMPILE-TIME FLAGS
+  /DHAVE_LIBBF=1          libbf arbitrary-precision bignum + float (optional)
+  /DHAVE_FFI=1            libffi (Windows uses built-in x64 ABI without this)
+  /DHAVE_TINYGL=1         TinyGL software 3D (optional)
+
+WINDOWS BUILD (MSVC, build.bat)
+  nmake /f Makefile.win
+  Output: build\l.exe
+
+POSIX BUILD
+  make
+  Output: build/l
+
+OUTPUT
+  build/l                    interactive REPL
+  build/l script.l           run script
+  build/l -e "(+ 1 2)"      eval expression and print
+
+
+================================================================================
+  PART XVII -- KNOWN LIMITATIONS AND INTENTIONAL DESIGN DECISIONS
+================================================================================
+
+1. FLOATING-POINT PRECISION
+   L uses 128-bit libbf floats (39 decimal digits), not IEEE 754.
+   This means 0.1 * 0.2 = 0.02 exactly, but values don't round-trip
+   with C doubles.  Use (float x) to convert, (float? x) to test.
+
+2. (append a b c) TAKES EXACTLY 2 ARGS
+   The third argument is silently ignored.  To concatenate three lists:
+   (append (append a b) c)
+
+3. FINITE GENERATOR DRAIN -- PRIME-AND-PUMP PATTERN
+   (while (co-alive? gen) (co-resume gen)) includes the body's NIL return value.
+   Always use:  (let ((v (co-resume gen NIL))) (while (co-alive? gen) ...))
+   See Part X for the full pattern.
+
+4. DYNAMIC SCOPING DEFAULT
+   de functions see variables from the call stack.  Use lambda for lexical closures.
+   A lambda defined inside a de body closes over the de's parameters.
+
+5. NO GARBAGE COLLECTION OF SYMBOLS
+   Once interned, symbols live forever.  SYM_SLOT_COUNT = 131,072.
+   Programs generating many unique symbols (gensym loops) should track g_sym_count.
+
+6. NO CALL/CC
+   Use coroutines for generators/continuations; catch/throw for non-local exits.
+
+7. COROUTINES ARE COOPERATIVE
+   Coroutines use userspace switching (Win Fibers / POSIX ucontext).
+   They are always available -- no conditional compilation required.
+   They do NOT use threads -- purely cooperative single-threaded switching.
+
+8. NUMERIC TOWER
+   int32 → bignum (exact integers, auto-promote on overflow).
+   float (128-bit libbf precision, explicit via literal 3.14 or (float x)).
+   No ratio, no complex.  Integer division truncates; use 1.0 for float division.
+
+9. PROPERTY LISTS ARE FLAT ALISTS
+   All properties on a symbol share one alist.  No namespace isolation.
+   Convention: use descriptive key symbols to avoid collisions.
+
+10. WINDOWS FFI LIMITATION
+    The built-in x64 ABI caller does not support double arguments.
+    Link libffi (/DHAVE_FFI=1) for double support on Windows.
+
+11. VECTOR POOL NEVER SHRINKS
+    g_vec_count never decreases.  VecSlot data arrays are free()'d by GC but
+    the slot itself is never reclaimed.  VEC_POOL_SIZE = 65,536 total vectors.
+
+
+================================================================================
+  PART XVIII -- IDIOMS AND PATTERNS
+================================================================================
+
+FUNCTION DEFINITIONS
+  (de add1 (n) (1+ n))                          ; fixed arity dynamic scoping
+  (de sum (lst) (apply + lst))                  ; higher-order
+  (de fold (fn acc lst)                         ; tail-recursive fold
+    (if (null lst) acc
+      (recur fn (fn acc (car lst)) (cdr lst))))
+
+CLOSURES
+  (de make-adder (n)
+    (lambda (x) (+ x n)))       ; n captured lexically from de parameter
+
+  (setq add5 (make-adder 5))
+  (add5 10)                     ; → 15
+
+OOP VIA PROPERTY LISTS
+  ; Create "object"
+  (put 'counter 'val 0)
+  (de counter-inc () (put 'counter 'val (1+ (get 'counter 'val))))
+  (de counter-get () (get 'counter 'val))
+
+  ; with/This shorthand
+  (with 'counter
+    (=: val (1+ (: val)))
+    (: val))
+
+LIST CONSTRUCTION
+  (make (link 1) (link 2) (chain (list 3 4 5)))     ; → (1 2 3 4 5)
+  (mapcar (lambda (x) (* x x)) (list 1 2 3))        ; → (1 4 9)
+  (filter (lambda (x) (> x 3)) (list 1 2 3 4 5))   ; → (4 5)
+
+GENERATORS AND PIPELINES
+  (de range (from to)
+    (co (lambda (_)
+      (let ((i from))
+        (while (<= i to)
+          (yield i)
+          (setq i (1+ i)))))))
+
+  (de map-gen (fn src)
+    (co (lambda (_)
+      (let ((v (co-resume src NIL)))
+        (while (co-alive? src)
+          (yield (fn v))
+          (setq v (co-resume src NIL)))
+        (if v (yield (fn v)))))))
+
+  ; Drain: collect all values
+  (let ((gen (map-gen (lambda (x) (* x x)) (range 1 5)))
+        (result NIL)
+        (v (co-resume gen NIL)))
+    (while (co-alive? gen)
+      (setq result (cons v result))
+      (setq v (co-resume gen NIL)))
+    (reverse result))               ; → (1 4 9 16 25)
+
+EXCEPTION HANDLING
+  (catch 'not-found
+    (if (null (get db 'key))
+      (throw 'not-found "missing")
+      (get db 'key)))
+
+LIVE CODING / AUDIO
+  (audio-init)
+  (audio-tone 440 500)             ; A4 for 500ms
+  (audio-tone 523 500)             ; C5 for 500ms
+  (sample-load "kick.wav" 'kick)
+  (sample-play 'kick 90)
+
+
+================================================================================
+  PART XIX -- VI EDITOR (demos/vi/)
+================================================================================
+
+Vi-flavoured modal editor with both a terminal renderer (ANSI escape codes,
+diff-based redraw) and a native graphics renderer (SDL-style primitives,
+TrueType text via ttf.c).  Shares one view layer so wrap mode, line numbers,
+visual highlighting, etc. are computed once and consumed by both backends.
+
+LAUNCH
+  ./build/l demos/24-vi.l [file]              terminal mode
+  ./build/l demos/24-vi.l --gfx [file]        native window
+
+ARCHITECTURE
+  state.l    Editor state as a 24-slot persistent vector (pvec).  Mutation
+             returns a new state; undo/redo just snapshot the buffer + cursor
+             onto a stack.  Slots: buffer, cursor, scroll, mode, visual,
+             cmd-buf, search, marks (26-slot pvec for a-z), registers, etc.
+
+  buffer.l   Buffer = a weight-balanced wbt tree (lib/rope.l) of line
+             strings.  O(log n) random line access; O(log n) insert/delete.
+             Cursor = (row . col), 1-based row, 0-based col.
+
+  cursor.l   cursor-clamp, cur-move-h/v, viewport-ensure.  viewport-ensure
+             has separate wrap and nowrap branches; wrap counts display rows
+             via wrap--display-row-of when deciding when to scroll.
+
+  ops.l     Operators d/c/y/</>, motions h/j/k/l/w/b/e/W/B/E/0/$/^/G/gg/ge/
+             H/M/L/{/}/%, text objects iw/aw/i"/a"/i(/a(/i[/a[/i{/a{/ip/ap,
+             paragraph motions, % matching bracket, find-char machinery.
+
+  mode.l     Mode-dispatch coroutine -- yields on each key, drives the state
+             machine for normal / insert / visual / command / search modes.
+             Handles operator-pending + prefix (g, Z, r, f/F/t/T, m, ',`,
+             q, @, i, a) sequences.
+
+  visual.l   visual-region (normalises anchor/cursor into a (r1 c1 r2 c2
+             kind) region), visual-key dispatcher.
+
+  search.l   Pure-L regex (. * + ? ^ $ [...] [^...] \w \d \s), search-forward
+             / search-backward / search-jump, * and # word-under-cursor jumps,
+             :s and :{range}s / :%s substitute.
+
+  cmd.l      Ex command parser: :w :q :wq :q! :e :s :{N} :set wrap/nowrap/
+             number/nonumber, optional range prefix (% or N or N1,N2).
+
+  render.l   ANSI terminal renderer.  Holds the SHARED view helpers
+             (render-line, render--collect, render--collect-wrap,
+             wrap--cursor-pos, view-cursor-pos, view-visual-range,
+             view-status-left / right, view-gutter-width / view-add-gutter,
+             render--apply-highlights).  render-frame-diff redraws only
+             rows that differ from the previous frame.
+
+  gfx.l      Native graphics renderer (sdl-* primitives).  Uses the same
+             view helpers from render.l; gfx-specific drawing only.
+
+  keys.l     Decode ANSI escape sequences (CSI / SS3) from raw stdin into
+             keyword keys (up/down/left/right/home/end/pgup/pgdn/del + Ctrl-X
+             combos) so the dispatch coroutine sees logical keys.
+
+  term.l     FFI bindings to the term_helper library: term-set-raw,
+             term-alt-screen, term-get-cols/rows, term-read-byte.
+
+  macro.l    qa-qz record / @a-@z play.  Recording adds keys to a per-letter
+             register; playback injects them via 'macro-inject which the
+             macro-filter coroutine drains key by key.
+
+  file.l     file-read / file-write -- reads via read-all-lines, builds the
+             wbt tree via wbt-from-list (C primitive); writes via
+             wbt-to-list + write-lines.
+
+  vi.l       Entry point: argv parsing, loads modules, sets *vi-cols* /
+             *vi-rows* / *vi-wrap* / *vi-number*, dispatches terminal vs gfx.
+
+KEY BINDINGS (implemented)
+  Motions:           h j k l w b e W B E 0 $ ^ gg G ge H M L { } %
+                     f{c} F{c} t{c} T{c} ; ,  arrow keys / Home / End / PgUp/Dn
+  Operators:         d c y < >  (doubled forms dd cc yy << >>)
+                     D (= d$)  C (= c$)  Y (= yy)
+  Edit:              x  s  S  J  ~  r{c}  p  P  u  Ctrl-R
+  Insert entry:      i I a A o O
+  Insert helpers:    ESC  Enter (autoindent)  Bksp  Del
+                     Ctrl-W (kill word)  Ctrl-U (kill to BOL)
+  Visual:            v (char)  V (line)  -- selection rendered with reverse
+                     video (terminal) / fill rect (gfx)
+  Text objects:      iw aw  i" a"  i' a'  i( a( i) a) ib ab
+                     i[ a[ i] a]  i{ a{ i} a} iB aB
+                     ip ap (paragraph)
+  Search:            / ? n N * #  (* = word forward, # = word back)
+  Marks:             m{a-z}  '{a-z} (BOL)  `{a-z} (exact col)
+  Registers:         "{a-z}{op} -- direct yank / delete / paste to / from
+                     a named register.  Unnamed reg "" mirrors yanks.
+  Counts:            Counts work on motions (5j), operators (3dw, 2yy),
+                     edits (5x, 3p, 4~, 5J), replace (3rx), and on insert
+                     entry (10ahello<esc> appends "hello" ten times -- the
+                     count is preserved through the i/I/a/A/o/O dispatch
+                     and the typed text is replayed (count-1) times on ESC).
+  Macros:            q{a-z} record stop  @{a-z} play  (with count: 5@a)
+  Ex commands:       :w [path]  :q  :q!  :wq  :e path
+                     :{N}                                 jump to line N
+                     :s/pat/repl/[g]                      substitute current line
+                     :{N}s/.../...                        single line
+                     :{N1},{N2}s/.../...                  range
+                     :%s/.../...                          whole buffer
+                     :set wrap | nowrap | number | nonumber
+  Misc:              ZZ (= :wq)  ZQ (= :q!)
+
+DISPLAY
+  Diff-based terminal renderer: each frame writes only rows whose content
+  differs from the previous frame.  Status bar always redrawn (mode / msg /
+  cursor pos change every frame).  Order is goto -> clear-to-eol -> content,
+  so writing a cols-wide row never erases the next row via auto-wrap.
+
+  Alternate screen + atexit + signal handlers (term_helper.c) so :q, :q!,
+  Ctrl-C, SIGTERM, SIGSEGV all restore cooked mode + cursor + main screen.
+
+  :set wrap   long lines wrap onto subsequent screen rows (line-map drives
+              cursor position math; viewport-ensure-wrap scrolls by buffer
+              lines but counts display rows when deciding visibility).
+  :set number left-side gutter with right-aligned line numbers; effective
+              column count is reduced by gutter width, cursor + visual
+              highlight shifted by gutter width when drawing.
+  [+]         appended to filename in status bar when buffer is dirty.
+
+KNOWN GAPS (deferred)
+  - Case operators gu / gU / g~ + R Replace mode -- need a multi-step
+    prefix dispatch (g + u + motion); current pfx mechanism only carries
+    one prefix-key across iterations.
+  - . (repeat-last) -- stub; would need to record op + motion + count +
+    any inserted text.
+  - :set hlsearch / incsearch -- would need a separate highlight overlay
+    distinct from the visual selection and a per-keystroke search in / mode.
+  - gj / gk display-line motions for wrap mode.
+  - Splits, buffers, tabs (:sp, :ls, :b, :tabnew) -- single buffer for now.
+  - UTF-8 -- ASCII only; multibyte chars in lines aren't handled by the
+    column math.
+
+
+================================================================================
+  END OF SPECIFICATION
+================================================================================

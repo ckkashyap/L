@@ -1,0 +1,38 @@
+# Build output
+build/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Local temp directory (setup downloads)
+temp/
+
+# Downloaded / generated dependencies
+deps/
+!deps/libffi/
+!deps/libffi/**
+!deps/fonts/
+!deps/fonts/**
+!deps/SDL3_ttf/
+!deps/SDL3_ttf/include/
+!deps/SDL3_ttf/include/**
+!deps/SDL3_ttf/lib/
+!deps/SDL3_ttf/lib/x64/
+!deps/SDL3_ttf/lib/x64/SDL3_ttf.lib
+!deps/SDL3_ttf/lib/x64/SDL3_ttf.dll
+
+# Claude session data
+.claude/
+
+# Temporary test files at root
+test_exact.l
+test_find_crash.l
+test_full_bounded.l
+test_narrow.l
+test_narrow2.l
+test_poll_first.l
+test_unbound.l
+test_unbounded2.l

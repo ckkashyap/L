@@ -1,0 +1,60 @@
+# Makefile.win — nmake for Visual Studio 2022 (cl.exe)
+# Native I/O and graphics: no libuv, no SDL.
+CC      = cl.exe
+LINK    = link.exe
+CFLAGS  = /std:c17 /O2 /W3 /FImsvc_compat.h \
+          /Isrc /Ideps\libbf
+LIBS    = ws2_32.lib iphlpapi.lib userenv.lib psapi.lib \
+          gdi32.lib user32.lib ole32.lib ksuser.lib winmm.lib
+
+# libffi is always enabled on Windows (bundled in deps\libffi\).
+# The callbacks.c translation unit requires HAVE_FFI.
+CFLAGS  = $(CFLAGS) /DHAVE_FFI=1 /Ideps\libffi\include
+LIBS    = $(LIBS) deps\libffi\lib\libffi.lib
+FFI_OBJ = build\ffi.obj build\callbacks.obj
+
+!ifdef HAVE_LIBBF
+CFLAGS  = $(CFLAGS) /DHAVE_LIBBF=1
+LIBS    = $(LIBS) deps\libbf\libbf.lib
+!endif
+
+!ifdef HAVE_TINYGL
+CFLAGS  = $(CFLAGS) /DHAVE_TINYGL=1 /Ideps\tinygl\include
+LIBS    = $(LIBS) deps\tinygl\tinygl.lib
+TGL_OBJ = build\tinygl_bridge.obj
+!else
+TGL_OBJ =
+!endif
+
+OBJS = build\main.obj build\heap.obj build\sym.obj build\reader.obj \
+       build\eval.obj build\print.obj build\prims.obj build\bignum.obj \
+       build\native_io_win32.obj build\native_gfx_win32.obj \
+       build\pipe_win32.obj build\coro.obj build\ttf.obj \
+       $(TGL_OBJ) $(FFI_OBJ)
+
+TARGET = build\l.exe
+
+all: $(TARGET) build\term_helper.dll
+
+$(TARGET): $(OBJS)
+	$(LINK) /OUT:$(TARGET) $(OBJS) $(LIBS) $(LFLAGS) /ignore:4098 /ignore:4217 /ignore:4286
+	if exist deps\libffi\bin\libffi-8.dll copy /Y deps\libffi\bin\libffi-8.dll build\libffi-8.dll
+
+{src\}.c{build\}.obj:
+	$(CC) $(CFLAGS) /Fo$@ /c $<
+
+build:
+	if not exist build mkdir build
+
+clean:
+	if exist build rmdir /s /q build
+
+build\cb_helper.dll: tests\helpers\cb_helper.c
+	$(CC) /LD tests\helpers\cb_helper.c /Fe:build\cb_helper.dll /link /EXPORT:call1 /EXPORT:call2 /EXPORT:call0 /EXPORT:call_and_add
+
+build\term_helper.dll: src\term_helper.c
+	if not exist build mkdir build
+	$(CC) /LD src\term_helper.c /Fe:build\term_helper.dll
+
+test: $(TARGET) build\cb_helper.dll build\term_helper.dll
+	powershell -File run_tests.ps1
