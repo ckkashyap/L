@@ -111,6 +111,14 @@ if errorlevel 1 (
     echo term_helper.dll OK
 )
 
+REM --- Build cb_helper.dll (required for FFI callback tests) ---
+cl.exe /LD /O2 tests\helpers\cb_helper.c /Fe:build\cb_helper.dll /link /EXPORT:call1 /EXPORT:call2 /EXPORT:call0 /EXPORT:call_and_add >nul 2>&1
+if errorlevel 1 (
+    echo WARNING: cb_helper.dll build failed - callback tests will not work
+) else (
+    echo cb_helper.dll OK
+)
+
 echo.
 echo Build OK: build\l.exe
 goto end

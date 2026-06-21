@@ -34,7 +34,7 @@ OBJS = build\main.obj build\heap.obj build\sym.obj build\reader.obj \
 
 TARGET = build\l.exe
 
-all: $(TARGET) build\term_helper.dll
+all: $(TARGET) build\term_helper.dll build\cb_helper.dll
 
 $(TARGET): $(OBJS)
 	$(LINK) /OUT:$(TARGET) $(OBJS) $(LIBS) $(LFLAGS) /ignore:4098 /ignore:4217 /ignore:4286
