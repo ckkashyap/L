@@ -3,8 +3,8 @@ set -e
 # setup.sh -- First-time dependency setup for Linux/WSL/macOS
 #
 # Dependencies:
-#   Required: gcc, make, libx11-dev, libasound2-dev
-#   Optional: libffi-dev (for FFI), libbf (bignum), TinyGL (3D)
+#   Required: gcc, make, pkg-config, libx11-dev, libasound2-dev, libffi-dev
+#   Optional: libbf (bignum, built by this script), TinyGL (3D)
 
 MAX_SETUP=false
 for arg in "$@"; do
@@ -22,12 +22,25 @@ echo "=== L Interpreter Setup ==="
 mkdir -p deps/libbf deps/fonts deps/tinygl temp
 
 # Check for required tools
-for tool in gcc make curl; do
+for tool in gcc make curl pkg-config; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "ERROR: $tool is required but not found. Please install it."
         exit 1
     fi
 done
+
+# Check for required system libraries (Linux/WSL only)
+if [ "$(uname -s)" = "Linux" ]; then
+    MISSING_PKGS=""
+    pkg-config --exists x11    2>/dev/null || MISSING_PKGS="$MISSING_PKGS libx11-dev"
+    pkg-config --exists alsa   2>/dev/null || MISSING_PKGS="$MISSING_PKGS libasound2-dev"
+    pkg-config --exists libffi 2>/dev/null || MISSING_PKGS="$MISSING_PKGS libffi-dev"
+    if [ -n "$MISSING_PKGS" ]; then
+        echo "Missing system libraries:$MISSING_PKGS"
+        echo "Install with:  sudo apt-get install -y$MISSING_PKGS"
+        exit 1
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # libbf -- arbitrary precision bignum library
@@ -161,7 +174,6 @@ fi
 
 echo ""
 echo "Setup complete."
-echo "  Install system deps: sudo apt-get install -y libx11-dev libasound2-dev libffi-dev pkgconf"
 echo "  Build:   make"
 echo "  Test:    bash run_tests.sh"
 echo "  Options: make NO_TINYGL=1  (skip TinyGL)"

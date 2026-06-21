@@ -26,7 +26,7 @@ The entire interpreter fits in ~12,000 lines of C.
 
 | Platform | Requirements |
 |----------|-------------|
-| Linux    | `gcc`, `make`, `libx11-dev`, `libasound2-dev` |
+| Linux    | `gcc`, `make`, `pkg-config`, `libx11-dev`, `libasound2-dev`, `libffi-dev` |
 | Windows  | Visual Studio 2022 (or Build Tools) with C++ workload |
 
 ### Setup & Build
