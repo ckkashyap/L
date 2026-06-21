@@ -3,7 +3,7 @@ $pass = 0; $fail = 0; $skip = 0
 
 Get-ChildItem 'C:\s\L\tests\test_*.l' | ForEach-Object {
     $name = $_.Name
-    if ($name -match 'sdl|gfx|http|pmap|uv') {
+    if ($name -match 'sdl|gfx|pmap|uv') {
         Write-Host "SKIP $name" -ForegroundColor DarkGray
         $skip++
         return
