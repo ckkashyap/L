@@ -18,10 +18,10 @@
 
 # ── :w -- write ───────────────────────────────────────────────────────────
 
-(let ((st (vi-run "hello" '(":" "w" " " "/" "t" "m" "p" "/" "v" "i" "t" "e" "s" "t" "1" "." "t" "x" "t" ret))))
-  (check "/tmp/vitest1.txt" (s-get st 'filename) ":w sets filename"))
+(let ((st (vi-run "hello" '(":" "w" " " "b" "u" "i" "l" "d" "/" "v" "i" "t" "e" "s" "t" "1" "." "t" "x" "t" ret))))
+  (check "build/vitest1.txt" (s-get st 'filename) ":w sets filename"))
 
-(let ((st (vi-run "hello" '("i" "X" esc ":" "w" " " "/" "t" "m" "p" "/" "v" "i" "t" "e" "s" "t" "2" "." "t" "x" "t" ret))))
+(let ((st (vi-run "hello" '("i" "X" esc ":" "w" " " "b" "u" "i" "l" "d" "/" "v" "i" "t" "e" "s" "t" "2" "." "t" "x" "t" ret))))
   (check NIL (s-get st 'dirty) ":w clears dirty flag"))
 
 # ── :N -- jump to line N ───────────────────────────────────────────────────
